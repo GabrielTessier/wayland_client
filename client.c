@@ -8,6 +8,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #define DEBUG(fd, color, type, format, ...)             \
     do {                                                \
@@ -74,13 +76,18 @@ enum object_type_e {
   IFACE_WL_COMPOSITOR,
   IFACE_WL_SURFACE,
   IFACE_WL_SHM,
+  IFACE_WL_SHM_POOL,
+  IFACE_WL_BUFFER,
+  IFACE_XDG_WM_BASE,
+  IFACE_XDG_SURFACE,
+  IFACE_XDG_TOPLEVEL,
 };
 
 typedef enum object_type_e object_type_t;
 
 typedef struct {
     object_type_t type;
-    int id;
+    uint32_t id;
 } object_t;
 
 int last_used_id = 1;
@@ -105,11 +112,18 @@ uint32_t new_object(object_type_t type) {
     return last_used_id;
 }
 
-object_type_t get_object_type(int id) {
+object_type_t get_object_type(uint32_t id) {
     for (int i = 0; i < nb_object; i++) {
         if (objects[i].id == id) return objects[i].type;
     }
     return IFACE_UNKNOWN;
+}
+
+uint32_t get_object_id(object_type_t type) {
+    for (int i = 0; i < nb_object; i++) {
+        if (objects[i].type == type) return objects[i].id;
+    }
+    return 0;
 }
 
 
@@ -122,6 +136,20 @@ void call(int fd, int obj_id, int function_id, uint32_t param_len, char *param) 
         write(fd, param, param_len);
         LOG("WR : param : %d\n", *((uint32_t*)param));
     }
+}
+
+void call_string(int fd, uint32_t obj_id, int function_id, uint32_t string_len, char *str) {
+    uint32_t padding = (4 - string_len % 4) % 4;
+    uint32_t total = 8 + sizeof(uint32_t) + string_len + padding;
+    uint8_t buf[total];
+    memset(buf, 0, total);
+    uint8_t *p = buf;
+    uint32_t length_code = (total << 16) | function_id;
+    memcpy(p, &obj_id, 4);       p += 4;
+    memcpy(p, &length_code, 4);  p += 4;
+    memcpy(p, &string_len, 4);   p += 4;
+    memcpy(p, str, string_len);  p += string_len;
+    write(fd, buf, total);
 }
 
 /* wl_display opcodes (requests) */
@@ -171,22 +199,30 @@ void new_callback(int fd, uint32_t orig_id, void (*fnc)(int, uint32_t, uint32_t)
     call(fd, 1, WL_DISPLAY_SYNC, sizeof(uint32_t), (char*)&id);
 }
 
-void call_wl_registry_bind(int fd, int obj_id, uint32_t name, uint32_t interface_len, char *interface, uint32_t version, uint32_t new_id) {
+void call_wl_registry_bind(int fd, int obj_id, uint32_t name,
+                           uint32_t interface_len, char *interface,
+                           uint32_t version, uint32_t new_id) {
+    uint32_t padding = (4 - interface_len % 4) % 4;
+    uint32_t total_length = 8 + sizeof(name) + sizeof(interface_len) +
+                            interface_len + padding + sizeof(version) +
+                            sizeof(new_id);
     uint32_t m[2] = {
-        obj_id,
-        ((8+sizeof(name)+sizeof(interface_len)+interface_len+4-interface_len%4+sizeof(version)+sizeof(new_id)) << 16) | WL_REGISTRY_BIND
-    };
-    write(fd, m, sizeof(m));
-    write(fd, &name, sizeof(name));
-    write(fd, &interface_len, sizeof(interface_len));
-    write(fd, interface, interface_len);
-    if (interface_len % 4 != 0) {
-        uint32_t zero = 0;
-        write(fd, &zero, 4 - interface_len % 4);
-        LOG("write %d zero\n", 4 - interface_len % 4);
-    }
-    write(fd, &version, sizeof(version));
-    write(fd, &new_id, sizeof(new_id));
+        obj_id, (total_length<<16) | WL_REGISTRY_BIND};
+    uint8_t buf[total_length];
+    memset(buf, 0, total_length);
+    uint8_t *p = buf;
+
+    uint32_t length_code = (total_length << 16) | WL_REGISTRY_BIND;
+    memcpy(p, &obj_id, 4);                p += 4;
+    memcpy(p, &length_code, 4);           p += 4;
+    memcpy(p, &name, 4);                  p += 4;
+    memcpy(p, &interface_len, 4);         p += 4;
+    memcpy(p, interface, interface_len);  p += interface_len;
+    p += padding;
+    memcpy(p, &version, 4);               p += 4;
+    memcpy(p, &new_id, 4);                p += 4;
+
+    write(fd, buf, total_length);
 
     LOG("bind : %d, %d, %d, %d, %s, %d, %d\n", obj_id, WL_REGISTRY_BIND, name, interface_len, interface, version, new_id);
 }
@@ -206,20 +242,140 @@ header_t read_header(int fd) {
     };
 }
 
-void compositor_callback(int fd, uint32_t orig_id, uint32_t serial) {
-    LOG("Compositor bind (serial=%u)\n", serial);
+uint32_t compositor_create_surface(int fd, uint32_t compositor_id) {
+    LOG("Compositor create surface\n");
     uint32_t surface_id = new_object(IFACE_WL_SURFACE);
     // wl_compositor::create_surface
-    call(fd, orig_id, 0, sizeof(uint32_t), (char *)&surface_id);
+    call(fd, compositor_id, 0, sizeof(uint32_t), (char *)&surface_id);
+    LOG("Compositor create surface END\n");
+    return surface_id;
+}
+
+void xdg_configure(int fd, uint32_t surface_id) {
+    LOG("XDG_wm_base\n");
+    uint32_t xdg_wm_base_id = get_object_id(IFACE_XDG_WM_BASE);
+    uint32_t xdg_surface_id = new_object(IFACE_XDG_SURFACE);
+    struct {
+        uint32_t new_id, surface_id;
+    } data = {
+        .new_id = xdg_surface_id,
+        .surface_id = surface_id,
+    };
+    // xdg_wm_base::get_xdg_surface
+    call(fd, xdg_wm_base_id, 2, sizeof(data), (char *)&data);
+
+    uint32_t xdg_toplevel_id = new_object(IFACE_XDG_TOPLEVEL);
+    LOG("toplevel id : %d\n", xdg_toplevel_id);
+    // xdg_surface::get_toplevel
+    call(fd, xdg_surface_id, 1, sizeof(uint32_t), (char *)&xdg_toplevel_id);
+
+    // xdg_toplevel::set_title
+    call_string(fd, xdg_toplevel_id, 2, 7, "coucou");
+    // xdg_toplevel::set_app_id
+    call_string(fd, xdg_toplevel_id, 2, 7, "app.id");
+    LOG("XDG_wm_base END\n");
+}
+
+void wl_buffer_callback(int fd, uint32_t buffer_fd, uint32_t serial) {
+    LOG("Buffer callback (serial=%u)\n", serial);
+    uint32_t surface_id = get_object_id(IFACE_WL_SURFACE);
+    LOG("XDG_wm_base\n");
+    
+    uint32_t xdg_wm_base_id = get_object_id(IFACE_XDG_WM_BASE);
+    uint32_t xdg_surface_id = get_object_id(IFACE_XDG_SURFACE);
+
+    // xdg_surface::ack_configure
+    call(fd, xdg_surface_id, 4, sizeof(uint32_t), (char *)&serial);
+
+    struct {
+        uint32_t buffer_id;
+        int32_t x, y;
+    } data_attach = { .buffer_id = buffer_fd, .x = 0, .y = 0 };
     // wl_surface::attach
-    /* uint32_t attach_len; */
-    /* char *attach_param; */
-    /* call(fd, surface_id, 1, attach_len, attach_param); */
-    LOG("Compositor bind END (serial=%u)\n", serial);
+    call(fd, surface_id, 1, sizeof(data_attach), (char *)&data_attach);
+
+    struct {
+        int32_t x, y, width, height;
+    } data_damage_buffer = { .x = 0, .y = 0, .width = 100, .height = 100 };
+    // wl_surface::damage_buffer
+    call(fd, surface_id, 9, sizeof(data_damage_buffer), (char *)&data_damage_buffer);
+
+    // wl_surface::commit
+    call(fd, surface_id, 6, 0, NULL);
+    
+    LOG("XDG_wm_base END\n");
+    LOG("Buffer callback END\n");
 }
 
 void wl_shm_callback(int fd, uint32_t orig_id, uint32_t serial) {
     LOG("Shm bind (serial=%u)\n", serial);
+    shm_unlink("client_shm");
+    int shm_fd = shm_open("client_shm", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (shm_fd < 0) {
+        perror("shm_open");
+        return;
+    }
+
+    uint32_t format = 1;  // 32-bit RGB format, [31:0] x:R:G:B 8:8:8:8 little endian
+    uint32_t width = 100;
+    uint32_t height = 100;
+    uint32_t stride = width * 4;   // 40 bytes per row
+    uint32_t shm_size = stride * height;
+    
+    if (ftruncate(shm_fd, shm_size) < 0) {
+        perror("ftruncate");
+        return;
+    }
+    // wl_surface::create_pool
+    struct msghdr msg = { 0 };
+    struct cmsghdr *cmsg;
+
+    uint32_t pool_id = new_object(IFACE_WL_SHM_POOL);
+    uint32_t m[4] = {orig_id, ((8 + 8) << 16) | 0, pool_id,
+                     100};
+    struct iovec io = {.iov_base = m, .iov_len = sizeof(m)};
+    union {         /* Ancillary data buffer, wrapped in a union
+                       in order to ensure it is suitably aligned */
+        char buf[CMSG_SPACE(sizeof(shm_fd))];
+        struct cmsghdr align;
+    } u;
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = u.buf;
+    msg.msg_controllen = sizeof(u.buf);
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(shm_fd));
+    memcpy(CMSG_DATA(cmsg), &shm_fd, sizeof(shm_fd));
+    LOG("Sending create_pool: obj=%u opcode=0 size=16 new_id=%u shm_size=%u\n",
+        orig_id, pool_id, 100);
+    LOG("  raw: %08x %08x %08x %08x\n", m[0], m[1], m[2], m[3]);
+    ssize_t sent = sendmsg(fd, &msg, 0);
+    if (sent < 0) {
+      perror("sendmsg");
+      return;
+    }
+    LOG("sendmsg sent %zd bytes\n", sent);
+
+    uint32_t buffer_id = new_object(IFACE_WL_BUFFER);
+    
+    struct __attribute__((packed)) {
+        uint32_t new_id;
+        int32_t offset, width, height, stride;
+        uint32_t format;
+    } data = {
+        .new_id = buffer_id,
+        .offset = 0,
+        .width = width,
+        .height = height,
+        .stride = stride,
+        .format = format
+    };
+    call(fd, pool_id, 0, sizeof(data), (char *)&data);
+
+    new_callback(fd, buffer_id, wl_buffer_callback);
+    
     LOG("Shm bind END (serial=%u)\n", serial);
 }
 
@@ -271,13 +427,18 @@ uint8_t wl_registry(int fd, int devnull, header_t hdr) {
             LOG("New wl_compositor id : %d\n", compositor_id);
             call_wl_registry_bind(fd, hdr.obj_id, name, 14, interface, version,
                                   compositor_id);
-            new_callback(fd, compositor_id, compositor_callback);
+            /* new_callback(fd, compositor_id, compositor_callback); */
         } else if (strcmp(interface, "wl_shm") == 0) {
             uint32_t shm_id = new_object(IFACE_WL_SHM);
             LOG("New wl_shm id : %d\n", shm_id);
             call_wl_registry_bind(fd, hdr.obj_id, name, 7, interface, version,
                                   shm_id);
-            new_callback(fd, 0, wl_shm_callback);
+            /* new_callback(fd, shm_id, wl_shm_callback); */
+        } else if (strcmp(interface, "xdg_wm_base") == 0) {
+            uint32_t xdg_wm_base_id = new_object(IFACE_XDG_WM_BASE);
+            LOG("New xdg_wm_base_id : %d\n", xdg_wm_base_id);
+            call_wl_registry_bind(fd, hdr.obj_id, name, 12, interface, version,
+                                  xdg_wm_base_id);
         }
         free(interface);
         return 1;
@@ -300,12 +461,87 @@ uint8_t wl_registry(int fd, int devnull, header_t hdr) {
     }
 }
 
-void callback_get_registry(int fd, uint32_t orig_id, uint32_t serial) {
-    LOG("Sync done (serial=%u) - all globals received.\n", serial);
+void wl_shm_config(int fd, uint32_t wl_shm_id) {
+    LOG("Shm config\n");
+    shm_unlink("client_shm");
+    int shm_fd = shm_open("client_shm", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (shm_fd < 0) {
+        perror("shm_open");
+        return;
+    }
+
+    uint32_t format = 1;  // 32-bit RGB format, [31:0] x:R:G:B 8:8:8:8 little endian
+    uint32_t width = 100;
+    uint32_t height = 100;
+    uint32_t stride = width * 4;   // 40 bytes per row
+    uint32_t shm_size = stride * height;
+    
+    if (ftruncate(shm_fd, shm_size) < 0) {
+        perror("ftruncate");
+        return;
+    }
+    // wl_surface::create_pool
+    struct msghdr msg = { 0 };
+    struct cmsghdr *cmsg;
+
+    uint32_t pool_id = new_object(IFACE_WL_SHM_POOL);
+    uint32_t m[4] = {wl_shm_id, ((8 + 8) << 16) | 0, pool_id,
+                     100};
+    struct iovec io = {.iov_base = m, .iov_len = sizeof(m)};
+    union {         /* Ancillary data buffer, wrapped in a union
+                       in order to ensure it is suitably aligned */
+        char buf[CMSG_SPACE(sizeof(shm_fd))];
+        struct cmsghdr align;
+    } u;
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = u.buf;
+    msg.msg_controllen = sizeof(u.buf);
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(shm_fd));
+    memcpy(CMSG_DATA(cmsg), &shm_fd, sizeof(shm_fd));
+    LOG("Sending create_pool: obj=%u opcode=0 size=16 new_id=%u shm_size=%u\n",
+        wl_shm_id, pool_id, 100);
+    LOG("  raw: %08x %08x %08x %08x\n", m[0], m[1], m[2], m[3]);
+    ssize_t sent = sendmsg(fd, &msg, 0);
+    if (sent < 0) {
+      perror("sendmsg");
+      return;
+    }
+    LOG("sendmsg sent %zd bytes\n", sent);
+
+    uint32_t buffer_id = new_object(IFACE_WL_BUFFER);
+    
+    struct __attribute__((packed)) {
+        uint32_t new_id;
+        int32_t offset, width, height, stride;
+        uint32_t format;
+    } data = {.new_id = buffer_id,
+              .offset = 0,
+              .width = width,
+              .height = height,
+              .stride = stride,
+              .format = format};
+    // wl_shm_pool::create_buffer
+    call(fd, pool_id, 0, sizeof(data), (char *)&data);
+
+    new_callback(fd, buffer_id, wl_buffer_callback);
+    
+    LOG("Shm config END\n");
 }
 
-int main(void)
-{
+void callback_get_registry(int fd, uint32_t orig_id, uint32_t serial) {
+    LOG("Sync done (serial=%u) - all globals received.\n", serial);
+    uint32_t compositor_id = get_object_id(IFACE_WL_COMPOSITOR);
+    uint32_t surface_id = compositor_create_surface(fd, compositor_id);
+    xdg_configure(fd, surface_id);
+    // wl_surface::commit
+    call(fd, surface_id, 6, 0, NULL);
+}
+
+int main(void) {
     const char *xdg = getenv("XDG_RUNTIME_DIR");
     if (!xdg) {
       ERROR("No XDG_RUNTIME_DIR in env\n");
@@ -352,15 +588,19 @@ int main(void)
         
         switch (get_object_type(hdr.obj_id)) {
         case IFACE_WL_DISPLAY:
+            LOG("IFACE_WL_DISPLAY event\n");
             ok = wl_display(fd, devnull, hdr);
             break;
         case IFACE_WL_REGISTRY:
+            LOG("IFACE_WL_REGISTRY event\n");
             ok = wl_registry(fd, devnull, hdr);
             break;
         case IFACE_WL_CALLBACK:
+            LOG("IFACE_WL_CALLBACK event\n");
             if (hdr.opcode == 0) {
                 read_all(fd, &serial, 4);
                 printf("\n");
+                LOG("callback event serial = %u\n", serial);
                 ok = 1;
                 for (int i = 0; i < nb_callbacks; i++) {
                     if (callbacks[i].id == hdr.obj_id) {
@@ -370,6 +610,22 @@ int main(void)
                 /* fini = 1; */
             }
             break;
+        case IFACE_XDG_SURFACE:
+            LOG("IFACE_XDG_SURFACE event\n");
+            if (hdr.opcode == 0) {
+                read_all(fd, &serial, 4);
+                LOG("configure event serial = %u\n", serial);
+                uint32_t wl_shm_id = get_object_id(IFACE_WL_SHM);
+                wl_shm_config(fd, wl_shm_id);
+                ok = 1;
+            }
+            break;
+        case IFACE_XDG_TOPLEVEL:
+            LOG("IFACE_XDG_TOPLEVEL event\n");
+            if (hdr.opcode == 1) {
+                ok = 1;
+                fini = 1;
+            }
         default:
             WARN("Unknown object id (%d)\n", hdr.obj_id);
             break;
