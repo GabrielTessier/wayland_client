@@ -224,8 +224,6 @@ void call_wl_registry_bind(int fd, int obj_id, uint32_t name,
     uint32_t total_length = 8 + sizeof(name) + sizeof(interface_len) +
                             interface_len + padding + sizeof(version) +
                             sizeof(new_id);
-    uint32_t m[2] = {
-        obj_id, (total_length<<16) | WL_REGISTRY_BIND};
     uint8_t buf[total_length];
     memset(buf, 0, total_length);
     uint8_t *p = buf;
@@ -404,12 +402,15 @@ uint8_t wl_registry(int fd, header_t hdr) {
 
 void wl_shm_config(int fd, uint32_t wl_shm_id, uint32_t configure_serial) {
     DEBUG("Shm config\n");
-    shm_unlink("client_shm");
-    int shm_fd = shm_open("client_shm", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    // max pid : 4194304
+    char name[11 + 7 + 1];
+    sprintf(name, "client_shm_%d", getpid());
+    int shm_fd = shm_open(name, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (shm_fd < 0) {
         perror("shm_open");
         return;
     }
+    shm_unlink(name);
 
     uint32_t format = 1;  // 32-bit RGB format, [31:0] x:R:G:B 8:8:8:8 little endian
     uint32_t stride = width * 4;   // 40 bytes per row
@@ -656,6 +657,5 @@ int main(void) {
     }
 
     close(fd);
-    shm_unlink("client_shm");
     return 0;
 }
