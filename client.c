@@ -22,32 +22,17 @@
 #define WARN(format, ...) DEBUG_PRINT(stderr, "\e[0;33m", "WARNING", format, __VA_ARGS__)
 #define ERROR(format, ...) DEBUG_PRINT(stderr, "\e[0;31m", "ERROR", format, __VA_ARGS__)
 
-int skip(int fd, int devnull, uint32_t len) {
-    char *emp;
-    ssize_t nbread = 0;
-    if (devnull >= 0) {
-        while (len - nbread > 0) {
-            int res = splice(fd, 0, devnull, 0, len - nbread, 0);
-            if (res == -1) goto copy;
-            if (res >= 0) {
-                nbread += res;
-            }
-        }
-        goto end;
-    }
- copy:
-    emp = (char*)malloc(len);
-    while (len - nbread > 0) {
-        ssize_t nr = read(fd, emp, len - nbread);
-        if (nr < 0) {
+int skip(int fd, uint32_t len) {
+    char buf[1024];
+    while (len > 0) {
+        ssize_t n = read(fd, buf, len < sizeof(buf) ? len : sizeof(buf));
+        if (n < 0) {
             perror("read");
             return -1;
         }
-        nbread += nr;
+        len -= n;
     }
-    free(emp);
- end:
-    return nbread;
+    return 0;
 }
 
 /*
@@ -348,7 +333,7 @@ void wl_buffer_callback(int fd, callback_t callback, uint32_t serial) {
     DEBUG("Buffer callback END\n");
 }
 
-uint8_t wl_display(int fd, int devnull, header_t hdr) {
+uint8_t wl_display(int fd, header_t hdr) {
     int32_t id;
     uint32_t code;
     char *msg;
@@ -368,20 +353,14 @@ uint8_t wl_display(int fd, int devnull, header_t hdr) {
         return 1;
     default:
         /* unknown display event – skip body */
-        while (hdr.body) {
-            /* hdr.body -= splice(fd, NULL, devnull, NULL, hdr.body, 0); */
-            int sk = skip(fd, devnull, hdr.body);
-            if (sk < 0) {
-                perror("skip");
-                return 0;
-            }
-            hdr.body -= sk;
+        if (skip(fd, hdr.body) < 0) {
+            perror("skip");
         }
         return 0;
     }
 }
 
-uint8_t wl_registry(int fd, int devnull, header_t hdr) {
+uint8_t wl_registry(int fd, header_t hdr) {
     uint32_t name;
     char *interface;
     uint32_t version;
@@ -416,15 +395,8 @@ uint8_t wl_registry(int fd, int devnull, header_t hdr) {
         DEBUG("global_remove: name=%u\n", name);
         return 1;
     default:
-        /* unknown registry event – skip body */
-        while (hdr.body) {
-            /* hdr.body -= splice(fd, NULL, devnull, NULL, hdr.body, 0); */
-            int sk = skip(fd, devnull, hdr.body);
-            if (sk < 0) {
-                perror("skip");
-                return 0;
-            }
-            hdr.body -= sk;
+        if (skip(fd, hdr.body) < 0) {
+            perror("skip");
         }
         return 0;
     }
@@ -553,41 +525,6 @@ int main(void) {
     }
     LOG("Connected to %s\n\n", path);
 
-    int devnull = -1, devnull_fd = -1, devnull_pipe[2];
-    // Need a pipe for splice (man 2 splice)
-    if (pipe(devnull_pipe) == -1) {
-        perror("pipe");
-        devnull_pipe[0] = -1;
-        devnull_pipe[1] = -1;
-        goto skip_dev_null;
-    }
-    if ((devnull_fd = open("/dev/null", O_WRONLY)) == -1) {
-        perror("devnull");
-        close(devnull_pipe[0]);
-        close(devnull_pipe[1]);
-        devnull_pipe[1] = -1;
-        goto skip_dev_null;
-    }
-    if (dup2(devnull_pipe[0], devnull_fd) == -1) {
-        perror("dup2");
-        close(devnull_fd);
-        close(devnull_pipe[0]);
-        close(devnull_pipe[1]);
-        devnull_pipe[1] = -1;
-        goto skip_dev_null;
-    }
-    if (close(devnull_pipe[0]) == -1) {
-        perror("close fd[READ]");
-        close(devnull_fd);
-        close(devnull_pipe[0]);
-        close(devnull_pipe[1]);
-        devnull_pipe[1] = -1;
-        goto skip_dev_null;
-    }
-
- skip_dev_null:
-    devnull = devnull_pipe[1];
-
     {
         uint32_t id = new_object(IFACE_WL_REGISTRY);
         call(fd, 1, WL_DISPLAY_GET_REGISTRY, sizeof(uint32_t), (char*)&id);
@@ -609,10 +546,10 @@ int main(void) {
         LOG("%s event\n", object_type_to_string(type));
         switch (type) {
         case IFACE_WL_DISPLAY:
-            ok = wl_display(fd, devnull, hdr);
+            ok = wl_display(fd, hdr);
             break;
         case IFACE_WL_REGISTRY:
-            ok = wl_registry(fd, devnull, hdr);
+            ok = wl_registry(fd, hdr);
             break;
         case IFACE_WL_CALLBACK:
             if (hdr.opcode == 0) {
@@ -663,7 +600,7 @@ int main(void) {
                 read_all(fd, &array, array_len);
                 uint32_t total_read = 4 + 4 + 4 + array_len;
                 if ((array_len % 4) != 0) {
-                    skip(fd, devnull, 4 - (array_len % 4));
+                    skip(fd, 4 - (array_len % 4));
                     DEBUG("skip: %d\n", 4 - (array_len % 4));
                     total_read += 4 - (array_len % 4);
                 }
@@ -676,9 +613,10 @@ int main(void) {
                 DEBUG("body : %d\n", hdr.body);
                 // FIXME
                 DEBUG("skip : %d\n", hdr.body - total_read);
-                skip(fd, devnull, hdr.body - total_read);
+                skip(fd, hdr.body - total_read);
                 ok = 1;
             }
+            break;
         case IFACE_WL_COMPOSITOR:
             break;
         case IFACE_WL_SURFACE:
@@ -711,20 +649,12 @@ int main(void) {
 
         /* anything else: skip */
         WARN("Unknown event : object type %s id = %d, opcode = %d\n", object_type_to_string(type), hdr.obj_id, hdr.opcode);
-        while (hdr.body) {
-            int sk = skip(fd, devnull, hdr.body);
-            if (sk < 0) {
-              perror("skip");
-              fini = 1;
-            }
-            hdr.body -= sk;
+        if (skip(fd, hdr.body) < 0) {
+            perror("skip");
+            fini = 1;
         }
     }
 
-    if (devnull >= 0) {
-        close(devnull_pipe[1]);
-        close(devnull_fd);
-    }
     close(fd);
     shm_unlink("client_shm");
     return 0;
