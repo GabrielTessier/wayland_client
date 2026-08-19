@@ -22,17 +22,31 @@
 #define WARN(format, ...) DEBUG_PRINT(stderr, "\e[0;33m", "WARNING", format, __VA_ARGS__)
 #define ERROR(format, ...) DEBUG_PRINT(stderr, "\e[0;31m", "ERROR", format, __VA_ARGS__)
 
-int skip(int fd, uint32_t len) {
-    char *emp = malloc(len);
+int skip(int fd, int devnull, uint32_t len) {
+    char *emp;
     ssize_t nbread = 0;
+    if (devnull >= 0) {
+        while (len - nbread > 0) {
+            int res = splice(fd, 0, devnull, 0, len - nbread, 0);
+            if (res == -1) goto copy;
+            if (res >= 0) {
+                nbread += res;
+            }
+        }
+        goto end;
+    }
+ copy:
+    emp = (char*)malloc(len);
     while (len - nbread > 0) {
-        ssize_t nr = read(fd, emp, len);
+        ssize_t nr = read(fd, emp, len - nbread);
         if (nr < 0) {
             perror("read");
             return -1;
         }
         nbread += nr;
     }
+    free(emp);
+ end:
     return nbread;
 }
 
@@ -356,7 +370,7 @@ uint8_t wl_display(int fd, int devnull, header_t hdr) {
         /* unknown display event – skip body */
         while (hdr.body) {
             /* hdr.body -= splice(fd, NULL, devnull, NULL, hdr.body, 0); */
-            int sk = skip(fd, hdr.body);
+            int sk = skip(fd, devnull, hdr.body);
             if (sk < 0) {
                 perror("skip");
                 return 0;
@@ -405,7 +419,7 @@ uint8_t wl_registry(int fd, int devnull, header_t hdr) {
         /* unknown registry event – skip body */
         while (hdr.body) {
             /* hdr.body -= splice(fd, NULL, devnull, NULL, hdr.body, 0); */
-            int sk = skip(fd, hdr.body);
+            int sk = skip(fd, devnull, hdr.body);
             if (sk < 0) {
                 perror("skip");
                 return 0;
@@ -446,8 +460,8 @@ void wl_shm_config(int fd, uint32_t wl_shm_id, uint32_t configure_serial) {
         } else {
             memset(shm_mem, 0, shm_size);
         }
+        munmap(shm_mem, shm_size);
     }
-
     
     
     // wl_surface::create_pool
@@ -478,7 +492,6 @@ void wl_shm_config(int fd, uint32_t wl_shm_id, uint32_t configure_serial) {
     ssize_t sent = sendmsg(fd, &msg, 0);
     if (sent < 0) {
       perror("sendmsg");
-      munmap(shm_mem, shm_size);
       close(shm_fd);
       return;
     }
@@ -540,7 +553,40 @@ int main(void) {
     }
     LOG("Connected to %s\n\n", path);
 
-    int devnull = open("/dev/null", O_WRONLY);
+    int devnull = -1, devnull_fd = -1, devnull_pipe[2];
+    // Need a pipe for splice (man 2 splice)
+    if (pipe(devnull_pipe) == -1) {
+        perror("pipe");
+        devnull_pipe[0] = -1;
+        devnull_pipe[1] = -1;
+        goto skip_dev_null;
+    }
+    if ((devnull_fd = open("/dev/null", O_WRONLY)) == -1) {
+        perror("devnull");
+        close(devnull_pipe[0]);
+        close(devnull_pipe[1]);
+        devnull_pipe[1] = -1;
+        goto skip_dev_null;
+    }
+    if (dup2(devnull_pipe[0], devnull_fd) == -1) {
+        perror("dup2");
+        close(devnull_fd);
+        close(devnull_pipe[0]);
+        close(devnull_pipe[1]);
+        devnull_pipe[1] = -1;
+        goto skip_dev_null;
+    }
+    if (close(devnull_pipe[0]) == -1) {
+        perror("close fd[READ]");
+        close(devnull_fd);
+        close(devnull_pipe[0]);
+        close(devnull_pipe[1]);
+        devnull_pipe[1] = -1;
+        goto skip_dev_null;
+    }
+
+ skip_dev_null:
+    devnull = devnull_pipe[1];
 
     {
         uint32_t id = new_object(IFACE_WL_REGISTRY);
@@ -617,7 +663,7 @@ int main(void) {
                 read_all(fd, &array, array_len);
                 uint32_t total_read = 4 + 4 + 4 + array_len;
                 if ((array_len % 4) != 0) {
-                    skip(fd, 4 - (array_len % 4));
+                    skip(fd, devnull, 4 - (array_len % 4));
                     DEBUG("skip: %d\n", 4 - (array_len % 4));
                     total_read += 4 - (array_len % 4);
                 }
@@ -630,7 +676,7 @@ int main(void) {
                 DEBUG("body : %d\n", hdr.body);
                 // FIXME
                 DEBUG("skip : %d\n", hdr.body - total_read);
-                skip(fd, hdr.body - total_read);
+                skip(fd, devnull, hdr.body - total_read);
                 ok = 1;
             }
         case IFACE_WL_COMPOSITOR:
@@ -666,7 +712,7 @@ int main(void) {
         /* anything else: skip */
         WARN("Unknown event : object type %s id = %d, opcode = %d\n", object_type_to_string(type), hdr.obj_id, hdr.opcode);
         while (hdr.body) {
-            int sk = skip(fd, hdr.body);
+            int sk = skip(fd, devnull, hdr.body);
             if (sk < 0) {
               perror("skip");
               fini = 1;
@@ -674,8 +720,11 @@ int main(void) {
             hdr.body -= sk;
         }
     }
-    
-    close(devnull);
+
+    if (devnull >= 0) {
+        close(devnull_pipe[1]);
+        close(devnull_fd);
+    }
     close(fd);
     shm_unlink("client_shm");
     return 0;
