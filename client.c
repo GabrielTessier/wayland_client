@@ -334,77 +334,6 @@ void wl_buffer_callback(int fd, callback_t callback, uint32_t serial) {
     DEBUG("Buffer callback END\n");
 }
 
-void wl_shm_callback(int fd, uint32_t orig_id, uint32_t serial) {
-    DEBUG("Shm bind (serial=%u)\n", serial);
-    shm_unlink("client_shm");
-    int shm_fd = shm_open("client_shm", O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (shm_fd < 0) {
-        perror("shm_open");
-        return;
-    }
-
-    uint32_t format = 1;  // 32-bit RGB format, [31:0] x:R:G:B 8:8:8:8 little endian
-    uint32_t stride = width * 4;   // 40 bytes per row
-    uint32_t shm_size = stride * height;
-    
-    if (ftruncate(shm_fd, shm_size) < 0) {
-        perror("ftruncate");
-        return;
-    }
-    // wl_surface::create_pool
-    struct msghdr msg = { 0 };
-    struct cmsghdr *cmsg;
-
-    uint32_t pool_id = new_object(IFACE_WL_SHM_POOL);
-    uint32_t m[4] = {orig_id, ((8 + 8) << 16) | 0, pool_id,
-                     100};
-    struct iovec io = {.iov_base = m, .iov_len = sizeof(m)};
-    union {         /* Ancillary data buffer, wrapped in a union
-                       in order to ensure it is suitably aligned */
-        char buf[CMSG_SPACE(sizeof(shm_fd))];
-        struct cmsghdr align;
-    } u;
-    msg.msg_iov = &io;
-    msg.msg_iovlen = 1;
-    msg.msg_control = u.buf;
-    msg.msg_controllen = sizeof(u.buf);
-    cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(shm_fd));
-    memcpy(CMSG_DATA(cmsg), &shm_fd, sizeof(shm_fd));
-    DEBUG("Sending create_pool: obj=%u opcode=0 size=16 new_id=%u shm_size=%u\n",
-        orig_id, pool_id, 100);
-    DEBUG("  raw: %08x %08x %08x %08x\n", m[0], m[1], m[2], m[3]);
-    ssize_t sent = sendmsg(fd, &msg, 0);
-    if (sent < 0) {
-      perror("sendmsg");
-      close(shm_fd);
-      return;
-    }
-    DEBUG("sendmsg sent %zd bytes\n", sent);
-
-    uint32_t buffer_id = new_object(IFACE_WL_BUFFER);
-    
-    struct __attribute__((packed)) {
-        uint32_t new_id;
-        int32_t offset, width, height, stride;
-        uint32_t format;
-    } data = {
-        .new_id = buffer_id,
-        .offset = 0,
-        .width = width,
-        .height = height,
-        .stride = stride,
-        .format = format
-    };
-    call(fd, pool_id, 0, sizeof(data), (char *)&data);
-
-    new_callback(fd, buffer_id, wl_buffer_callback, NULL, 0);
-    
-    DEBUG("Shm bind END (serial=%u)\n", serial);
-}
-
 uint8_t wl_display(int fd, int devnull, header_t hdr) {
     int32_t id;
     uint32_t code;
@@ -460,7 +389,6 @@ uint8_t wl_registry(int fd, int devnull, header_t hdr) {
             DEBUG("New wl_shm id : %d\n", shm_id);
             call_wl_registry_bind(fd, hdr.obj_id, name, 7, interface, version,
                                   shm_id);
-            /* new_callback(fd, shm_id, wl_shm_callback); */
         } else if (strcmp(interface, "xdg_wm_base") == 0) {
             uint32_t xdg_wm_base_id = new_object(IFACE_XDG_WM_BASE);
             DEBUG("New xdg_wm_base_id : %d\n", xdg_wm_base_id);
@@ -500,7 +428,7 @@ void wl_shm_config(int fd, uint32_t wl_shm_id, uint32_t configure_serial) {
     uint32_t format = 1;  // 32-bit RGB format, [31:0] x:R:G:B 8:8:8:8 little endian
     uint32_t stride = width * 4;   // 40 bytes per row
     uint32_t shm_size = stride * height;
-    DEBUG("AAAAAAAAAAAAAAAAAAAA : width : %d, height : %d, size : %d", width, height, shm_size);
+    DEBUG("shm info : width : %d, height : %d, size : %d", width, height, shm_size);
     
     if (ftruncate(shm_fd, shm_size) < 0) {
         perror("ftruncate");
@@ -749,5 +677,6 @@ int main(void) {
     
     close(devnull);
     close(fd);
+    shm_unlink("client_shm");
     return 0;
 }
