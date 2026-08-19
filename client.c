@@ -17,7 +17,7 @@
         fprintf(fd, format __VA_OPT__(, ) __VA_ARGS__); \
     } while (0)
 
-#define DEBUG(format, ...) //DEBUG_PRINT(stderr, "\e[0;34m", "DEBUG", format, __VA_ARGS__)
+#define DEBUG(format, ...) DEBUG_PRINT(stderr, "\e[0;34m", "DEBUG", format, __VA_ARGS__)
 #define LOG(format, ...) DEBUG_PRINT(stderr, "\e[0;34m", "LOG", format, __VA_ARGS__)
 #define WARN(format, ...) DEBUG_PRINT(stderr, "\e[0;33m", "WARNING", format, __VA_ARGS__)
 #define ERROR(format, ...) DEBUG_PRINT(stderr, "\e[0;31m", "ERROR", format, __VA_ARGS__)
@@ -106,6 +106,8 @@ int last_used_id = 1;
 uint32_t nb_object = 1;
 object_t *objects = &((object_t){.type = IFACE_WL_DISPLAY, .id = 1});
 
+uint32_t width = 0, height = 0;
+
 uint32_t new_object(object_type_t type) {
     if (nb_object == 1) {
         objects = malloc(sizeof(object_t) * (nb_object+1));
@@ -141,7 +143,8 @@ uint32_t get_object_id(object_type_t type) {
 void call(int fd, int obj_id, int function_id, uint32_t param_len, char *param) {
     uint32_t m[2] = {obj_id, ((8 + param_len) << 16) | function_id};
     write(fd, m, sizeof(m));
-    LOG("CALL : obj_id : %s(%d), function_id : %d\n", object_type_to_string(obj_id), obj_id, function_id);
+    object_type_t type = get_object_type(obj_id);
+    LOG("CALL : obj_id : %s(%d), function_id : %d\n", object_type_to_string(type), obj_id, function_id);
     DEBUG("param_len = %d\n", param_len);
     if (param_len != 0) {
         write(fd, param, param_len);
@@ -188,14 +191,17 @@ typedef struct {
 } header_t;
 
 
-typedef struct {
-    void (*fnc)(int fd, uint32_t orig_id, uint32_t serial);
+struct callback_s {
+    void (*fnc)(int fd, struct callback_s callback_elem, uint32_t serial);
     uint32_t orig_id;
     uint32_t id;
-} callback_t;
+    void *extra_data;
+    uint32_t extra_data_size;
+};
+typedef struct callback_s callback_t;
 uint32_t nb_callbacks = 0;
 callback_t *callbacks = NULL;
-void new_callback(int fd, uint32_t orig_id, void (*fnc)(int, uint32_t, uint32_t)) {
+void new_callback(int fd, uint32_t orig_id, void (*fnc)(int, callback_t, uint32_t), void* extra_data, uint32_t extra_data_size) {
     uint32_t id = new_object(IFACE_WL_CALLBACK);
     if (callbacks == NULL) {
         callbacks = malloc(sizeof(callback_t));
@@ -207,6 +213,8 @@ void new_callback(int fd, uint32_t orig_id, void (*fnc)(int, uint32_t, uint32_t)
     callbacks[nb_callbacks-1].fnc = fnc;
     callbacks[nb_callbacks - 1].id = id;
     callbacks[nb_callbacks - 1].orig_id = orig_id;
+    callbacks[nb_callbacks - 1].extra_data = extra_data;
+    callbacks[nb_callbacks - 1].extra_data_size = extra_data_size;
     call(fd, 1, WL_DISPLAY_SYNC, sizeof(uint32_t), (char*)&id);
 }
 
@@ -235,7 +243,8 @@ void call_wl_registry_bind(int fd, int obj_id, uint32_t name,
 
     write(fd, buf, total_length);
 
-    LOG("bind : %s(%d), %d, %d, %d, %s, %d, %d\n", object_type_to_string(obj_id), obj_id, WL_REGISTRY_BIND, name, interface_len, interface, version, new_id);
+    object_type_t type = get_object_type(obj_id);
+    LOG("bind : %s(%d), %d, %d, %d, %s, %d, %d\n", object_type_to_string(type), obj_id, WL_REGISTRY_BIND, name, interface_len, interface, version, new_id);
 }
 
 header_t read_header(int fd) {
@@ -283,11 +292,11 @@ void xdg_configure(int fd, uint32_t surface_id) {
     // xdg_toplevel::set_title
     call_string(fd, xdg_toplevel_id, 2, 7, "coucou");
     // xdg_toplevel::set_app_id
-    call_string(fd, xdg_toplevel_id, 2, 7, "app.id");
+    call_string(fd, xdg_toplevel_id, 3, 7, "app.id");
     DEBUG("XDG_wm_base END\n");
 }
 
-void wl_buffer_callback(int fd, uint32_t buffer_fd, uint32_t serial) {
+void wl_buffer_callback(int fd, callback_t callback, uint32_t serial) {
     DEBUG("Buffer callback (serial=%u)\n", serial);
     uint32_t surface_id = get_object_id(IFACE_WL_SURFACE);
     DEBUG("XDG_wm_base\n");
@@ -295,19 +304,26 @@ void wl_buffer_callback(int fd, uint32_t buffer_fd, uint32_t serial) {
     uint32_t xdg_wm_base_id = get_object_id(IFACE_XDG_WM_BASE);
     uint32_t xdg_surface_id = get_object_id(IFACE_XDG_SURFACE);
 
+    uint32_t configure_serial = 0;
+    if (callback.extra_data_size == sizeof(uint32_t)) {
+        configure_serial = *((uint32_t *)callback.extra_data);
+    } else {
+        ERROR("wl_buffer_callback need a uint32_t in extra_data");
+    }
+
     // xdg_surface::ack_configure
-    call(fd, xdg_surface_id, 4, sizeof(uint32_t), (char *)&serial);
+    call(fd, xdg_surface_id, 4, sizeof(uint32_t), (char *)&configure_serial);
 
     struct {
         uint32_t buffer_id;
         int32_t x, y;
-    } data_attach = { .buffer_id = buffer_fd, .x = 0, .y = 0 };
+    } data_attach = { .buffer_id = callback.orig_id, .x = 0, .y = 0 };
     // wl_surface::attach
     call(fd, surface_id, 1, sizeof(data_attach), (char *)&data_attach);
 
     struct {
         int32_t x, y, width, height;
-    } data_damage_buffer = { .x = 0, .y = 0, .width = 100, .height = 100 };
+    } data_damage_buffer = { .x = 0, .y = 0, .width = width, .height = height };
     // wl_surface::damage_buffer
     call(fd, surface_id, 9, sizeof(data_damage_buffer), (char *)&data_damage_buffer);
 
@@ -328,8 +344,6 @@ void wl_shm_callback(int fd, uint32_t orig_id, uint32_t serial) {
     }
 
     uint32_t format = 1;  // 32-bit RGB format, [31:0] x:R:G:B 8:8:8:8 little endian
-    uint32_t width = 100;
-    uint32_t height = 100;
     uint32_t stride = width * 4;   // 40 bytes per row
     uint32_t shm_size = stride * height;
     
@@ -365,6 +379,7 @@ void wl_shm_callback(int fd, uint32_t orig_id, uint32_t serial) {
     ssize_t sent = sendmsg(fd, &msg, 0);
     if (sent < 0) {
       perror("sendmsg");
+      close(shm_fd);
       return;
     }
     DEBUG("sendmsg sent %zd bytes\n", sent);
@@ -385,7 +400,7 @@ void wl_shm_callback(int fd, uint32_t orig_id, uint32_t serial) {
     };
     call(fd, pool_id, 0, sizeof(data), (char *)&data);
 
-    new_callback(fd, buffer_id, wl_buffer_callback);
+    new_callback(fd, buffer_id, wl_buffer_callback, NULL, 0);
     
     DEBUG("Shm bind END (serial=%u)\n", serial);
 }
@@ -405,7 +420,8 @@ uint8_t wl_display(int fd, int devnull, header_t hdr) {
         return 1;
     case WL_DISPLAY_EV_DELETE_ID:
         read_all(fd, &id, 4);
-        LOG("wl_display.delete_id: %u\n", id);
+        object_type_t type = get_object_type(id);
+        LOG("wl_display.delete_id: %u, type : %s\n", id, object_type_to_string(type));
         return 1;
     default:
         /* unknown display event – skip body */
@@ -472,7 +488,7 @@ uint8_t wl_registry(int fd, int devnull, header_t hdr) {
     }
 }
 
-void wl_shm_config(int fd, uint32_t wl_shm_id) {
+void wl_shm_config(int fd, uint32_t wl_shm_id, uint32_t configure_serial) {
     DEBUG("Shm config\n");
     shm_unlink("client_shm");
     int shm_fd = shm_open("client_shm", O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -482,22 +498,37 @@ void wl_shm_config(int fd, uint32_t wl_shm_id) {
     }
 
     uint32_t format = 1;  // 32-bit RGB format, [31:0] x:R:G:B 8:8:8:8 little endian
-    uint32_t width = 100;
-    uint32_t height = 100;
     uint32_t stride = width * 4;   // 40 bytes per row
     uint32_t shm_size = stride * height;
+    DEBUG("AAAAAAAAAAAAAAAAAAAA : width : %d, height : %d, size : %d", width, height, shm_size);
     
     if (ftruncate(shm_fd, shm_size) < 0) {
         perror("ftruncate");
         return;
     }
+
+
+    // Create a memory-mapped region for the file.
+    void* shm_mem = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_mem == MAP_FAILED) {
+        perror("mmap");
+    } else {
+        if (width < 1000) {
+            memset(shm_mem, 255, shm_size);
+        } else {
+            memset(shm_mem, 0, shm_size);
+        }
+    }
+
+    
+    
     // wl_surface::create_pool
     struct msghdr msg = { 0 };
     struct cmsghdr *cmsg;
 
     uint32_t pool_id = new_object(IFACE_WL_SHM_POOL);
     uint32_t m[4] = {wl_shm_id, ((8 + 8) << 16) | 0, pool_id,
-                     100};
+                     shm_size};
     struct iovec io = {.iov_base = m, .iov_len = sizeof(m)};
     union {         /* Ancillary data buffer, wrapped in a union
                        in order to ensure it is suitably aligned */
@@ -514,11 +545,13 @@ void wl_shm_config(int fd, uint32_t wl_shm_id) {
     cmsg->cmsg_len = CMSG_LEN(sizeof(shm_fd));
     memcpy(CMSG_DATA(cmsg), &shm_fd, sizeof(shm_fd));
     DEBUG("Sending create_pool: obj=%u opcode=0 size=16 new_id=%u shm_size=%u\n",
-        wl_shm_id, pool_id, 100);
+        wl_shm_id, pool_id, shm_size);
     DEBUG("  raw: %08x %08x %08x %08x\n", m[0], m[1], m[2], m[3]);
     ssize_t sent = sendmsg(fd, &msg, 0);
     if (sent < 0) {
       perror("sendmsg");
+      munmap(shm_mem, shm_size);
+      close(shm_fd);
       return;
     }
     DEBUG("sendmsg sent %zd bytes\n", sent);
@@ -538,12 +571,14 @@ void wl_shm_config(int fd, uint32_t wl_shm_id) {
     // wl_shm_pool::create_buffer
     call(fd, pool_id, 0, sizeof(data), (char *)&data);
 
-    new_callback(fd, buffer_id, wl_buffer_callback);
+    uint32_t *extra_callback = (uint32_t *)malloc(sizeof(configure_serial));
+    *extra_callback = configure_serial;
+    new_callback(fd, buffer_id, wl_buffer_callback, extra_callback, sizeof(configure_serial));
     
     DEBUG("Shm config END\n");
 }
 
-void callback_get_registry(int fd, uint32_t orig_id, uint32_t serial) {
+void callback_get_registry(int fd, callback_t callback, uint32_t serial) {
     DEBUG("Sync done (serial=%u) - all globals received.\n", serial);
     uint32_t compositor_id = get_object_id(IFACE_WL_COMPOSITOR);
     uint32_t surface_id = compositor_create_surface(fd, compositor_id);
@@ -552,12 +587,7 @@ void callback_get_registry(int fd, uint32_t orig_id, uint32_t serial) {
     call(fd, surface_id, 6, 0, NULL);
 }
 
-
-static uint8_t init = 0, fini = 0;
-
-void fin_init(int fd, uint32_t init_addr, uint32_t serial) {
-    init = 1;
-}
+static uint8_t fini = 0;
 
 int main(void) {
     const char *xdg = getenv("XDG_RUNTIME_DIR");
@@ -589,7 +619,7 @@ int main(void) {
         call(fd, 1, WL_DISPLAY_GET_REGISTRY, sizeof(uint32_t), (char*)&id);
     }
     
-    new_callback(fd, 1, callback_get_registry);
+    new_callback(fd, 1, callback_get_registry, NULL, 0);
     
     while (!fini) {
         header_t hdr = read_header(fd);
@@ -605,14 +635,10 @@ int main(void) {
         LOG("%s event\n", object_type_to_string(type));
         switch (type) {
         case IFACE_WL_DISPLAY:
-            if (!init) {
-                ok = wl_display(fd, devnull, hdr);
-            }
+            ok = wl_display(fd, devnull, hdr);
             break;
         case IFACE_WL_REGISTRY:
-            if (!init) {
-                ok = wl_registry(fd, devnull, hdr);
-            }
+            ok = wl_registry(fd, devnull, hdr);
             break;
         case IFACE_WL_CALLBACK:
             if (hdr.opcode == 0) {
@@ -622,25 +648,62 @@ int main(void) {
                 ok = 1;
                 for (int i = 0; i < nb_callbacks; i++) {
                     if (callbacks[i].id == hdr.obj_id) {
-                        callbacks[i].fnc(fd, callbacks[i].orig_id, serial);
+                        callbacks[i].fnc(fd, callbacks[i], serial);
+                        if ((callbacks[i].extra_data_size == 0 &&
+                             callbacks[i].extra_data != NULL) ||
+                            (callbacks[i].extra_data_size != 0 &&
+                             callbacks[i].extra_data == NULL)) {
+                            object_type_t type = get_object_type(callbacks[i].orig_id);
+                            ERROR("callback with wrong extra parameter (from "
+                                  "%s(%d))",
+                                  object_type_to_string(type),
+                                  callbacks[i].orig_id);
+                        }
+                        if (callbacks[i].extra_data_size != 0) {
+                            free(callbacks[i].extra_data);
+                        }
                     }
                 }
             }
             break;
         case IFACE_XDG_SURFACE:
-            if (!init && hdr.opcode == 0) {
-                read_all(fd, &serial, 4);
+            if (hdr.opcode == 0) {
+                uint32_t configure_serial;
+                read_all(fd, &configure_serial, 4);
                 DEBUG("configure event serial = %u\n", serial);
                 uint32_t wl_shm_id = get_object_id(IFACE_WL_SHM);
-                wl_shm_config(fd, wl_shm_id);
-                new_callback(fd, 0, fin_init);
+                wl_shm_config(fd, wl_shm_id, configure_serial);
                 ok = 1;
             }
             break;
         case IFACE_XDG_TOPLEVEL:
             if (hdr.opcode == 1) { // exit
-                ok = 1;
                 fini = 1;
+                ok = 1;
+            } else if (hdr.opcode == 0) {
+                int32_t array_len;
+                read_all(fd, &width, 4);
+                read_all(fd, &height, 4);
+                read_all(fd, &array_len, 4);
+                uint8_t array[array_len];
+                read_all(fd, &array, array_len);
+                uint32_t total_read = 4 + 4 + 4 + array_len;
+                if ((array_len % 4) != 0) {
+                    skip(fd, 4 - (array_len % 4));
+                    DEBUG("skip: %d\n", 4 - (array_len % 4));
+                    total_read += 4 - (array_len % 4);
+                }
+                DEBUG("read : %d\n", total_read);
+                DEBUG("width: %d, height: %d, array_len: %d\n", width, height,
+                      array_len);
+                for (uint32_t i = 0; i < array_len; i++) {
+                    DEBUG("  %d\n", array[i]);
+                }
+                DEBUG("body : %d\n", hdr.body);
+                // FIXME
+                DEBUG("skip : %d\n", hdr.body - total_read);
+                skip(fd, hdr.body - total_read);
+                ok = 1;
             }
         case IFACE_WL_COMPOSITOR:
             break;
@@ -649,7 +712,12 @@ int main(void) {
         case IFACE_WL_BUFFER:
           break;
         case IFACE_WL_SHM:
-          break;
+            if (hdr.opcode == 0) {
+                read_all(fd, &serial, 4);  // format
+                DEBUG("FIXME: wl_shm format (%d)\n", serial);
+                ok = 1;
+            }
+            break;
         case IFACE_WL_SHM_POOL:
           break;
         case IFACE_XDG_WM_BASE:
@@ -668,7 +736,7 @@ int main(void) {
           continue;
 
         /* anything else: skip */
-        WARN("Unknown event : object id = %d, opcode = %d\n", hdr.obj_id, hdr.opcode);
+        WARN("Unknown event : object type %s id = %d, opcode = %d\n", object_type_to_string(type), hdr.obj_id, hdr.opcode);
         while (hdr.body) {
             int sk = skip(fd, hdr.body);
             if (sk < 0) {
