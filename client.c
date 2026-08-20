@@ -294,9 +294,9 @@ void xdg_configure(wl_state_t *state, uint32_t surface_id) {
     call(state, xdg_surface_id, 1, sizeof(uint32_t), (char *)&xdg_toplevel_id);
 
     // xdg_toplevel::set_title
-    call_string(state, xdg_toplevel_id, 2, 7, "coucou");
+    call_string(state, xdg_toplevel_id, 2, strlen("coucou")+1, "coucou");
     // xdg_toplevel::set_app_id
-    call_string(state, xdg_toplevel_id, 3, 7, "app.id");
+    call_string(state, xdg_toplevel_id, 3, strlen("app.id")+1, "app.id");
     DEBUG("XDG_wm_base END\n");
 }
 
@@ -379,18 +379,18 @@ uint8_t wl_registry(wl_state_t *state, header_t hdr) {
         if (strcmp(interface, "wl_compositor") == 0) {
             uint32_t compositor_id = new_object(state, IFACE_WL_COMPOSITOR);
             DEBUG("New wl_compositor id : %d\n", compositor_id);
-            call_wl_registry_bind(state, hdr.obj_id, name, 14, interface, version,
+            call_wl_registry_bind(state, hdr.obj_id, name, strlen("wl_compositor")+1, interface, version,
                                   compositor_id);
             /* new_callback(fd, compositor_id, compositor_callback); */
         } else if (strcmp(interface, "wl_shm") == 0) {
             uint32_t shm_id = new_object(state, IFACE_WL_SHM);
             DEBUG("New wl_shm id : %d\n", shm_id);
-            call_wl_registry_bind(state, hdr.obj_id, name, 7, interface, version,
+            call_wl_registry_bind(state, hdr.obj_id, name, strlen("wl_shm")+1, interface, version,
                                   shm_id);
         } else if (strcmp(interface, "xdg_wm_base") == 0) {
             uint32_t xdg_wm_base_id = new_object(state, IFACE_XDG_WM_BASE);
             DEBUG("New xdg_wm_base_id : %d\n", xdg_wm_base_id);
-            call_wl_registry_bind(state, hdr.obj_id, name, 12, interface, version,
+            call_wl_registry_bind(state, hdr.obj_id, name, strlen("wdg_wm_base")+1, interface, version,
                                   xdg_wm_base_id);
         }
         free(interface);
@@ -442,8 +442,17 @@ void wl_shm_config(wl_state_t *state, uint32_t wl_shm_id, uint32_t configure_ser
         }
         munmap(shm_mem, shm_size);
     }
+
+    // destroy previous buffer
+    uint32_t previous_buffer_id = get_object_id(state, IFACE_WL_BUFFER);
+    DEBUG("BUFFER ID : %d\n", previous_buffer_id);
+    //if (previous_buffer_id) call(state, previous_buffer_id, 0, 0, NULL);
     
-    
+    // destroy previous pool
+    uint32_t previous_pool_id = get_object_id(state, IFACE_WL_SHM_POOL);
+    //DEBUG("POOL ID : %d\n", previous_pool_id);
+    //if (previous_pool_id) call(state, previous_pool_id, 1, 0, NULL);
+
     // wl_surface::create_pool
     struct msghdr msg = { 0 };
     struct cmsghdr *cmsg;
@@ -454,8 +463,8 @@ void wl_shm_config(wl_state_t *state, uint32_t wl_shm_id, uint32_t configure_ser
     struct iovec io = {.iov_base = m, .iov_len = sizeof(m)};
     union {         /* Ancillary data buffer, wrapped in a union
                        in order to ensure it is suitably aligned */
-        char buf[CMSG_SPACE(sizeof(shm_fd))];
-        struct cmsghdr align;
+      char buf[CMSG_SPACE(sizeof(shm_fd))];
+      struct cmsghdr align;
     } u;
     msg.msg_iov = &io;
     msg.msg_iovlen = 1;
@@ -467,7 +476,7 @@ void wl_shm_config(wl_state_t *state, uint32_t wl_shm_id, uint32_t configure_ser
     cmsg->cmsg_len = CMSG_LEN(sizeof(shm_fd));
     memcpy(CMSG_DATA(cmsg), &shm_fd, sizeof(shm_fd));
     DEBUG("Sending create_pool: obj=%u opcode=0 size=16 new_id=%u shm_size=%u\n",
-        wl_shm_id, pool_id, shm_size);
+          wl_shm_id, pool_id, shm_size);
     DEBUG("  raw: %08x %08x %08x %08x\n", m[0], m[1], m[2], m[3]);
     ssize_t sent = sendmsg(state->fd, &msg, 0);
     if (sent < 0) {
@@ -495,6 +504,8 @@ void wl_shm_config(wl_state_t *state, uint32_t wl_shm_id, uint32_t configure_ser
     uint32_t *extra_callback = (uint32_t *)malloc(sizeof(configure_serial));
     *extra_callback = configure_serial;
     new_callback(state, buffer_id, wl_buffer_callback, extra_callback, sizeof(configure_serial));
+
+    close(shm_fd);
     
     DEBUG("Shm config END\n");
 }
@@ -569,13 +580,16 @@ int main(void) {
         // LOG("Request id(%d), opcode(%d), len(%d)\n", hdr.obj_id, hdr.opcode, hdr.msg_len);
         enum object_type_e type = get_object_type(&state, hdr.obj_id);
         LOG("%s event\n", object_type_to_string(type));
+
         switch (type) {
         case IFACE_WL_DISPLAY:
             ok = wl_display(&state, hdr);
             break;
+
         case IFACE_WL_REGISTRY:
             ok = wl_registry(&state, hdr);
             break;
+
         case IFACE_WL_CALLBACK:
             if (hdr.opcode == 0) {
                 read_all(fd, &serial, 4);
@@ -598,10 +612,14 @@ int main(void) {
                         if (state.callbacks[i].extra_data_size != 0) {
                             free(state.callbacks[i].extra_data);
                         }
+                        state.callbacks[i] = state.callbacks[--state.nb_callbacks];
+                        state.callbacks = realloc(state.callbacks, sizeof(callback_t) * state.nb_callbacks);
+                        break;
                     }
                 }
             }
             break;
+
         case IFACE_XDG_SURFACE:
             if (hdr.opcode == 0) {
                 uint32_t configure_serial;
@@ -612,6 +630,7 @@ int main(void) {
                 ok = 1;
             }
             break;
+
         case IFACE_XDG_TOPLEVEL:
             if (hdr.opcode == 1) { // exit
                 state.running = 0;
@@ -642,12 +661,16 @@ int main(void) {
                 ok = 1;
             }
             break;
+
         case IFACE_WL_COMPOSITOR:
             break;
+
         case IFACE_WL_SURFACE:
             break;
+
         case IFACE_WL_BUFFER:
           break;
+
         case IFACE_WL_SHM:
             if (hdr.opcode == 0) {
                 read_all(fd, &serial, 4);  // format
@@ -655,8 +678,10 @@ int main(void) {
                 ok = 1;
             }
             break;
+
         case IFACE_WL_SHM_POOL:
           break;
+
         case IFACE_XDG_WM_BASE:
             if (hdr.opcode == 0) { // ping
                 read_all(fd, &serial, 4); 
@@ -665,10 +690,12 @@ int main(void) {
                 ok = 1;
             }
             break;
+
         default:
             WARN("Unknown object id (%d)\n", hdr.obj_id);
             break;
         }
+
         if (ok)
           continue;
 
