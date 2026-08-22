@@ -446,12 +446,31 @@ void wl_shm_config(wl_state_t *state, uint32_t wl_shm_id, uint32_t configure_ser
     // destroy previous buffer
     uint32_t previous_buffer_id = get_object_id(state, IFACE_WL_BUFFER);
     DEBUG("BUFFER ID : %d\n", previous_buffer_id);
-    //if (previous_buffer_id) call(state, previous_buffer_id, 0, 0, NULL);
-    
+    if (previous_buffer_id) {
+        call(state, previous_buffer_id, 0, 0, NULL);
+        for (uint32_t i = 0; i < state->nb_object; i++) {
+            if (state->objects[i].id == previous_buffer_id) {
+                state->objects[i] = state->objects[--state->nb_object];
+                break;
+            }
+        }
+    }
+        
     // destroy previous pool
     uint32_t previous_pool_id = get_object_id(state, IFACE_WL_SHM_POOL);
-    //DEBUG("POOL ID : %d\n", previous_pool_id);
-    //if (previous_pool_id) call(state, previous_pool_id, 1, 0, NULL);
+    DEBUG("POOL ID : %d\n", previous_pool_id);
+    if (previous_pool_id) {
+        call(state, previous_pool_id, 1, 0, NULL);
+        for (uint32_t i = 0; i < state->nb_object; i++) {
+            if (state->objects[i].id == previous_pool_id) {
+                state->objects[i] = state->objects[--state->nb_object];
+                break;
+            }
+        }
+    }
+    if (previous_buffer_id || previous_pool_id) {
+        state->objects = realloc(state->objects, sizeof(object_t) * state->nb_object);
+    }
 
     // wl_surface::create_pool
     struct msghdr msg = { 0 };
