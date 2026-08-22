@@ -58,9 +58,9 @@ static char *read_wl_string(int fd)
 {
     uint32_t len;
     read_all(fd, &len, 4);
-    char *buf = calloc(1, len + 4);   /* +4 so padding never overflows */
-    read_all(fd, buf, len);
     uint32_t pad = (4 - (len % 4)) % 4;
+    char *buf = calloc(1, len + pad);   /* +4 so padding never overflows */
+    read_all(fd, buf, len);
     if (pad) {
         uint8_t sink[3];
         read_all(fd, sink, pad);
@@ -355,6 +355,13 @@ uint8_t wl_display(wl_state_t *state, header_t hdr) {
         read_all(state->fd, &id, 4);
         object_type_t type = get_object_type(state, id);
         LOG("wl_display.delete_id: %u, type : %s\n", id, object_type_to_string(type));
+        for (uint32_t i = 0; i < state->nb_object; i++) {
+            if (state->objects[i].id == id) {
+                state->objects[i] = state->objects[--state->nb_object];
+                state->objects = realloc(state->objects, sizeof(object_t) * state->nb_object);
+                break;
+            }
+        }
         return 1;
     default:
         /* unknown display event – skip body */
@@ -398,6 +405,7 @@ uint8_t wl_registry(wl_state_t *state, header_t hdr) {
     case WL_REGISTRY_EV_GLOBAL_REMOVE:
         read_all(state->fd, &name, 4);
         DEBUG("global_remove: name=%u\n", name);
+        WARN("wl_registry envent global_remove not implemented %d\n", __LINE__);
         return 1;
     default:
         if (skip(state->fd, hdr.body) < 0) {
@@ -448,28 +456,13 @@ void wl_shm_config(wl_state_t *state, uint32_t wl_shm_id, uint32_t configure_ser
     DEBUG("BUFFER ID : %d\n", previous_buffer_id);
     if (previous_buffer_id) {
         call(state, previous_buffer_id, 0, 0, NULL);
-        for (uint32_t i = 0; i < state->nb_object; i++) {
-            if (state->objects[i].id == previous_buffer_id) {
-                state->objects[i] = state->objects[--state->nb_object];
-                break;
-            }
-        }
     }
-        
+    
     // destroy previous pool
     uint32_t previous_pool_id = get_object_id(state, IFACE_WL_SHM_POOL);
     DEBUG("POOL ID : %d\n", previous_pool_id);
     if (previous_pool_id) {
         call(state, previous_pool_id, 1, 0, NULL);
-        for (uint32_t i = 0; i < state->nb_object; i++) {
-            if (state->objects[i].id == previous_pool_id) {
-                state->objects[i] = state->objects[--state->nb_object];
-                break;
-            }
-        }
-    }
-    if (previous_buffer_id || previous_pool_id) {
-        state->objects = realloc(state->objects, sizeof(object_t) * state->nb_object);
     }
 
     // wl_surface::create_pool
@@ -659,8 +652,9 @@ int main(void) {
                 read_all(state.fd, &state.width, 4);
                 read_all(state.fd, &state.height, 4);
                 read_all(state.fd, &array_len, 4);
-                uint8_t array[array_len];
-                read_all(fd, &array, array_len);
+                uint8_t *array = (uint8_t *)malloc(sizeof(uint8_t) * array_len);
+                DEBUG("ARRAY from malloc : %p\n", array);
+                read_all(fd, array, array_len);
                 uint32_t total_read = 4 + 4 + 4 + array_len;
                 if ((array_len % 4) != 0) {
                     skip(fd, 4 - (array_len % 4));
@@ -677,6 +671,7 @@ int main(void) {
                 // FIXME
                 DEBUG("skip : %d\n", hdr.body - total_read);
                 skip(fd, hdr.body - total_read);
+                free(array);
                 ok = 1;
             }
             break;
